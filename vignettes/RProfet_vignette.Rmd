@@ -1,0 +1,170 @@
+---
+title: "Rprofet Process"
+author: "Krystal Wang"
+date: "October 11, 2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#setwd("~/Documents/OneDrive - South Dakota State University - SDSU/Rprofet_Codes")
+library(dplyr)
+library(kableExtra)
+```
+
+This document goes through each of the functions in the Rprofet package and demonstrates how each works using the Lending Club data. The functions in the package are listed below:
+
+1. Variable Binning
+    + BinProfet
+2. Weights of Evidence Transformation and Information Value
+    + WOEProfet with filter
+3. Variable Selection
+    + WOEClust_hclust
+    + WOEClust_kmeans
+    + Step_logistic
+5. Visualization and Custom Binning of Variables
+    + WOEPlotter
+    + WOE_custom
+    + WOE_customFactor
+6. Scorecard
+    + ScorecardProfet_New
+    + ScoreNewData
+    
+```{r load package and data}
+library(myRprofet)
+data = lending_club
+```
+  
+The data set we will be using to illustrate the workflow of the Rprofet package is called Lending Club data. It consists of 20000 observations and 74 attributes. The variable "bad" is our target variable and the "ID" variable is unique for each observation. A target variable and an ID variable are required in order to use almost all functions in Rprofet package. The independent variables can be a mixture of character, factor, continuous, and binary types of data. Keep in mind that this package assumes unique IDs and all categorical data should be converted to factor data type beforehand. The goal of the Rprofet package is to allow the user control over each step of the credit scoring process when building a scorecard and applying the scorecard to a validation dataframe while still being flexible enough to handle the "messy" data. The "messy" data refers to data with multiple variable types, missing values, outliers, and special values, and such data is common in credit industry data. Below shows the snapshot of the first ten columns of the Lending Club data. For an example of our workflow, we first split the data into training and validation data sets with a 80:20 ratio. We will be building a scorecard based on the training set and using the scorecard to score the validation set.  
+    
+```{r data preview, echo=FALSE}
+#dim(data)
+#head(data[1:10])
+
+kableExtra::kbl(head(data[,1:10]), 
+                caption = "Head of first 10 columns of lending club data", 
+                booktabs = T,
+                linesep = "") %>%
+  kable_styling(latex_options = c("striped", "scale_down"))
+
+#splitting data
+set.seed(112233)
+##splitting data
+n <- nrow(data)
+split <- sample(c(rep(0, 0.8 * n),
+                  rep(1, 0.2 * n)))
+
+train <- data[split == 0, ] 
+validation <- data[split == 1, ]
+
+tb = data.frame(Dataset=c('Original','Training','Validation'), Rows=0, Columns=0)
+tb[1,2:3] = dim(data)
+tb[2,2:3] = dim(train)
+tb[3,2:3] = dim(validation)
+#data sets summary
+kableExtra::kbl(tb, caption = "Dimension of Data Sets",
+                booktabs = T,
+                linesep = "") %>%
+  kable_styling(latex_options = "striped")
+```
+
+## Coarse Binning of the variables
+
+Variable Binning is a process of transforming independent variables by dividing them into groups based on variable value. This process is also referred to as coarse classification. Although equal sized groups are ideal, the binning does not have to create same sized groups. One rule of thumb is each bin should contain a minimum of 5% of the population. If there are too few observations within a bin, joining similar groups can help to avoid the issue. The customized binning functions in later section is able to handle this issue. One nice feature of variable binning is that it reduces the inconsistencies within the data such as missing values, outliers, and non-linear relationships. In addition, variable binning is necessary for performing Weight of Evidence transformation.
+
+When using the \textbf{BinProfet()} function, multiple inputs for general shaping of the coarse bins are provided. For instance, we wish to specify that we would like each of the numeric variables to have $10$ bins. We also specify that we would like each bin to have a minimum of $200$ observations in each bin. Using the specified parameters, we then can perform coarse binning with the following codes. 
+
+```{r coarse binning}
+binData = New_BinProfet(data = train, id = "ID", target = "bad", num.bins = 10,
+                        min.pts.bin = 200)
+
+kableExtra::kbl(head(binData[1:10]), 
+                caption = "Head of first 10 columns of the binned data", 
+                booktabs = T,
+                linesep = "") %>%
+  kable_styling(latex_options = c("striped", "scale_down"))
+```
+
+Above is a snapshot of the output of the \textbf{BinProfet()} function. It returns a data frame with binned continuous values while making the factor variables stay the same. The missing values of each variables were treated as a separate attribute called "Missing." After binning, all variables have factor data type which handles the inconsistencies of the data type.
+
+Table 1 shows the frequency of each bin for the annual income attribute. We can see that the function will generally create similar sized bins as there are similar number of observations in each of the bins. Although the function tends to output the specified number of equal sized bins, this is not always the case as we see the last bin has the smallest number of observations. Sometimes the function outputs less or more bins than the specified number of bins, this happens because the bins will likely contain many outliers or values that would skew the distribution significantly. The \textbf{BinProfet()} function uses greedy binning algorithm. When the binning algorithm could not allocate all values into the specified number of bins, it tends to create extra bins. This situation would lead to less observations than the specified minimum number of observations in the extra bins. When the attribute of number of bins or minimum points in each bin are too large for a variable, the binning algorithm would create less bins than the specified attribute or ignore the minimum points bucket. Users might want to adjust the attributes if the majority of variables was not binned as expected, or fine tune some specific variables using the customized binning functions mentioned in later section.
+
+Another binning algorithm that is quantile-based performs similarly to the greedy algorithm. The two binning methods would create different bins for the numerical variables, but the two logistic models built in the end have similar predicting power. We decided to use the greedy binning method for \textbf{BinProfet()}, and when time allows we will be implementing a binning function using a quantile-based method.
+
+```{r example of a binned variable}
+kableExtra::kbl(table(binData$annual_inc_Bins), 
+                col.names = c("Variable Bins", "Frequency"), 
+                caption = "Frequency of each bin for annual income",
+                booktabs = T,
+                linesep = "") %>%
+  kable_styling(latex_options = "striped")
+```
+
+## WOE Transformation of the Bins
+
+After binning the mixture data types of variables into categorical data, the categories can then be converted to a continuous scale by performing weights of evidence (WOE) transformation for each bin. The WOE for a bin is a calculation measuring the log likelihood of being in bin $i$ given the value of the target variable. Let $\sum{0_i}$ and $\sum{0_t}$ be the sum of 0's in bin $i$ and the sum of 0's in the entire data set respectively. Similarly, let $\sum{1_i}$ and $\sum{1_t}$ be the sum of 1's in bin $i$ and the entire data set. Then
+
+\begin{align}
+\label{eq:woe}
+WOE_i &= \ln \left[  \frac{ p\left(i \mid y=1\right)} { p\left(i \mid y=0\right) }  \right] = \ln \left[        \nonumber \frac{\sum{1_i}/\sum{1_t}}{\sum{0_i}/\sum{0_t}} \right] = \ln \left[ \frac{\sum{1_i}\sum{0_t}}{\sum{0_i}\sum{1_t}} \right] \\
+&= \ln \left[ \frac{\sum{1_i}}{\sum{0_i}} \bigg/ \frac{\sum{1_t}}{\sum{0_t}} \right] = \ln \left[ \frac{\sum{1_i}}{\sum{0_i}}\right] - \ln \left[ \frac{\sum{1_t}}{\sum{0_t}} \right] 
+\end{align}
+
+After WOE transformation, the values of variables are continuous which makes the values easier to interpret intuitively. If $WOE_i$ is positive, then the odds for that group is larger than the overall sample odds. Similarly, if $WOE_i$ is negative, then the odds for that group is smaller than the overall sample odds. From equation \ref{eq:woe} above, we can see that the closer the WOE for a group is to 0, the closer the odds of the target for that group is to the overall sample odds. 
+
+Let $p_i$ and $p$ be the probability of a value of 1 for the target in group i and the entire data set respectively. 
+Then equation \ref{eq:woe} can be written as 
+
+\begin{align}
+\label{eq:woe2}
+WOE_i &= \ln \left[ \frac{\sum{1_i}}{\sum{0_i}}\right] - \ln \left[ \frac{\sum{1_t}}{\sum{0_t}} \right] 
+= \ln \left[ \frac{p_i}{1-p_i} \right] - \ln \left[ \frac{p}{1-p} \right]
+\end{align}
+
+Equation \ref{eq:woe2} shows that the weight of evidence and the logit function have linear relationship. This makes the weight of evidence variables being more appropriate for a logistic regression model.
+
+In Rprofet, we use the \textbf{WOEProfet()} in order to complete WOE transformation for variables.
+
+```{r WOE transformation, message=FALSE}
+WOEdata = WOEProfet_new(data = binData, id = "ID", target = "bad")
+```
+
+This function returns four items, each of them are important for the rest of the credit scoring process. When using a WOE transformation, we can calculate each variable's information value and determine how much information the variable provides when predicting the target variable. 
+
+Information value (IV) can be calculated directly from the Weights of Evidence. The IV for each bin is calculated and summed to get the overall IV for the variable given the bins. It implies that the IV is dependent on how the variable is binned and the number of bins of the variable. Assume variable $X$ has $n$ distinct bins, the IV of $X$ can be obtained using the following equation 
+
+$$
+IV_X = \sum_{i=1}^{n}\left(\frac{\sum{1_i}}{\sum{1_t}} -  \frac{\sum{0_i}}{\sum{0_t}}\right) \cdot WOE_i.
+$$
+Information value is commonly used to rank the importance of predictor variables. The advantage of IV is that it can be used for all variable types once they are binned and have gone through weight of evidence transformation. 
+
+Using the object "IV" returned from the \textbf{WOEProfet()} function, we can obtain the attributes with the highest information values.
+
+```{r an example of WOE}
+kableExtra::kbl(head(WOEdata$IV[order(-WOEdata$IV$IV),],10), 
+                caption = "Top 10 variables with the highest IV",
+                booktabs = T,
+                linesep = "") %>%
+  kable_styling(latex_options = "striped")
+```
+
+The variables above would arguably be the most important variables to include in our predictive model. In addition, the argument IVfilter allow us to choose a cutoff point for information values. For instance, we choose to filter the variables with information values greater than or equal to $0.02$, and now we have reduced the number of predictor variables from 72 to 29.
+
+```{r filter WOE object by IV, message=FALSE}
+#Do we want to sort all the items in the list by IV?
+subWOEdata = WOEProfet_new(data = binData, id = "ID", target = "bad",
+                                IVfilter = 0.02 )
+dim(subWOEdata$IV)[1]
+```
+
+Another useful object in the output of the \textbf{WOEProfet()} function is "vars". The object consists of a summary of WOE, target rate, and frequency of each bin for each of the input variables. For example, the summary of the bins for the variable "Verification Status" is shown below.
+
+```{r showcase the item vars in WOEProfet object}
+kableExtra::kbl(WOEdata$vars$verification_status, 
+                caption = "Top 10 variables with the highest IV",
+                booktabs = T,
+                linesep = "") %>%
+  kable_styling(latex_options = "striped")
+```
+
+Choosing a cutoff point in IV is an intuitive way to perform variable selection when building a credit scorecard. One drawback of this method is that IV does not take into account association between predictor variables. The Rprofet package also includes functions with variable clustering and Stepwise variable selection using Akaike information criterion (AIC).
